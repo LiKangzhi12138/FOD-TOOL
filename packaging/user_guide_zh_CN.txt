@@ -1,0 +1,23 @@
+机场跑道 FOD 标注工具
+
+使用方法：
+
+1. 请先完整解压 ZIP，再运行软件，不要直接在压缩包内双击 EXE。
+2. 双击 FOD标注工具.exe。
+3. 选择管理员分配的原始图片目录。
+4. 选择自己的独立 Worker Output 目录。
+5. 填写管理员分配的 annotator_id，例如 A01。
+6. 按管理员要求选择 S01 / S02 / S03。
+7. 初始化 Source 和 Tile 后开始标注。
+8. 每张 Tile 完成后点击“验证当前 Tile”或按 Space。
+9. 全部完成后点击“校验并封装 Worker Package”。
+10. 封装成功后，将整个 worker_output 文件夹交给管理员。
+
+注意：
+
+- 不要多人使用同一个 worker_output。
+- 不要手工修改 source.json、annotations.json、tiles.csv、package.json。
+- Finalize 后如果再次修改标注，必须重新 Finalize。
+- Merge Worker Packages 一般由管理员使用。
+- 用户数据目录由使用者在软件中选择，不要存放在本软件安装目录内。
+- 本软件当前未进行数字签名，首次启动时 Windows 可能显示 SmartScreen 提示。

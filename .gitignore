@@ -1,0 +1,95 @@
+# Python bytecode and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test, coverage, lint and type-check caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.tox/
+.nox/
+
+# Virtual environments and local Python installations
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# Packaging metadata and build artifacts
+*.egg-info/
+.eggs/
+wheels/
+/build/
+/dist/
+/release/
+
+# IDE and editor state
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Local environment and secrets (keep templates)
+.env
+.env.*
+!.env.example
+!.env.template
+*.pem
+*.key
+
+# Logs, temporary files and backups
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Transaction/staging directories created by the application
+**/.tmp_source_init_*/
+**/.tmp_tile_init_*/
+**/.tmp_annotation_init_*/
+**/.tmp_package_finalize_*/
+**/.tmp_master_merge_*/
+
+# Real project data and generated datasets at the repository root
+/data/
+/dataset/
+/datasets/
+/worker_output/
+/worker_outputs/
+/worker_packages/
+/master_dataset/
+/master_datasets/
+/exports/
+/output/
+/outputs/
+/annotations/
+/sources/
+/manifests/
+/logs/
+
+# Generated package/manifest files if the repository root is selected as output
+/source.json
+/annotations.json
+/package.json
+/master.json
+/merge_report.json
+/sources.csv
+/tiles.csv
+
+# Do not globally ignore image extensions: small synthetic fixtures may be committed
