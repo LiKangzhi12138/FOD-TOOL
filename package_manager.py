@@ -41,7 +41,9 @@ from tile_manager import (
 )
 
 
-TOOL_VERSION = "0.1.0"
+from protected_negatives import MANIFEST_PATH, load_protected_negatives
+
+TOOL_VERSION = "0.2.0"
 PACKAGE_SCHEMA_VERSION = "1.0"
 PACKAGE_TYPE = "worker"
 PACKAGE_REQUIRED_FIELDS = (
@@ -140,6 +142,7 @@ class WorkerPackageSnapshot:
     content_fingerprint: str | None = None
     package_data: dict[str, object] | None = None
     warnings: list[ValidationIssue] = field(default_factory=list)
+    protected_negatives: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -604,6 +607,9 @@ def compute_content_fingerprint(
                 ),
             ]
         )
+    # 1.0 包保持原始指纹算法。1.1 额外绑定唯一清单的完整字节。
+    if (root / MANIFEST_PATH).exists():
+        paths.append((MANIFEST_PATH.as_posix(), root / MANIFEST_PATH))
     digest = hashlib.sha256()
     for label, path in paths:
         if not path.is_file():
@@ -664,12 +670,12 @@ def load_finalized_worker_package(
                 package=root,
             )
         )
-    if data.get("schema_version") != PACKAGE_SCHEMA_VERSION:
+    if data.get("schema_version") not in {PACKAGE_SCHEMA_VERSION, "1.1"}:
         issues.append(
             _issue(
                 "PACKAGE_SCHEMA_MISMATCH",
                 f"package schema_version={data.get('schema_version')!r}，"
-                f"期望 {PACKAGE_SCHEMA_VERSION!r}。",
+                "支持 '1.0' 或 '1.1'。",
                 package=root,
             )
         )
@@ -705,6 +711,16 @@ def load_finalized_worker_package(
         )
     if issues:
         raise PackageValidationError("Worker package.json 校验失败", issues)
+
+    protected_path = root / MANIFEST_PATH
+    if data["schema_version"] == "1.1" and not protected_path.is_file():
+        raise PackageValidationError("重点负样本清单缺失", [
+            _issue("MISSING_FILE", str(protected_path), package=root)
+        ])
+    if data["schema_version"] == "1.0" and protected_path.exists():
+        raise PackageValidationError("1.0 包包含未声明的重点负样本清单，请重新 Finalize", [
+            _issue("PACKAGE_SCHEMA_MISMATCH", str(protected_path), package=root)
+        ])
 
     snapshot = _load_worker_content(
         root,
@@ -768,9 +784,29 @@ def load_finalized_worker_package(
     if comparison_issues:
         raise PackageValidationError("Worker Package 声明校验失败", comparison_issues + warnings)
     snapshot.content_fingerprint = actual_fingerprint
+    snapshot.protected_negatives = _validate_protected_manifest(root, snapshot)
     snapshot.package_data = data
     snapshot.warnings = warnings
     return snapshot
+
+
+def _validate_protected_manifest(root: Path, snapshot: WorkerPackageSnapshot) -> set[str]:
+    """Finalize/Merge 共用严格校验，错误必须带具体 SourceID/TileID。"""
+    try:
+        storage = AnnotationStorage.load_existing_read_only(
+            root, snapshot.annotator_id, sources=snapshot.sources,
+            tile_records=snapshot.tiles,
+        )
+        try:
+            return load_protected_negatives(
+                root, snapshot.tiles, storage.annotations, require_completed=True
+            )
+        finally:
+            storage.close()
+    except (ValueError, OSError, AnnotationStorageError) as exc:
+        raise PackageValidationError("重点负样本校验失败", [
+            _issue("PROTECTED_NEGATIVE_INVALID", str(exc), package=root)
+        ]) from exc
 
 
 def _timestamp_for_filename(timestamp: str) -> str:
@@ -926,6 +962,13 @@ def finalize_worker_package(
     staging: Path | None = None
     try:
         _append_operation_log(root, "Package finalize start")
+        existing_package = root / "package.json"
+        if existing_package.is_file():
+            previous_schema = _read_json(existing_package, "已有 package.json").get("schema_version")
+            if previous_schema == "1.1" and not (root / MANIFEST_PATH).is_file():
+                raise PackageValidationError("1.1 Worker 的重点负样本清单丢失，拒绝降级封装", [
+                    _issue("MISSING_FILE", str(root / MANIFEST_PATH), package=root)
+                ])
         snapshot = _load_worker_content(
             root,
             input_dir=input_dir,
@@ -945,6 +988,7 @@ def finalize_worker_package(
                     )
                 ],
             )
+        _validate_protected_manifest(root, snapshot)
         staging = Path(
             tempfile.mkdtemp(prefix=".tmp_package_finalize_", dir=root)
         )
@@ -971,7 +1015,7 @@ def finalize_worker_package(
             except (PackageValidationError, AnnotationStorageError):
                 created_at = timestamp
         package_data = {
-            "schema_version": PACKAGE_SCHEMA_VERSION,
+            "schema_version": "1.1" if (root / MANIFEST_PATH).exists() else PACKAGE_SCHEMA_VERSION,
             "package_type": PACKAGE_TYPE,
             "tool_version": TOOL_VERSION,
             "annotator_id": snapshot.annotator_id,

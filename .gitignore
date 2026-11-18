@@ -5,6 +5,7 @@ __pycache__/
 
 # Test, coverage, lint and type-check caches
 .pytest_cache/
+.test_tmp*/
 .coverage
 .coverage.*
 coverage.xml

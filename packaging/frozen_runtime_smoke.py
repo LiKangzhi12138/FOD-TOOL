@@ -113,12 +113,15 @@ def _create_completed_worker(
         storage.save_tile_annotation(
             record.tile_id, annotation, "frozen_smoke"
         )
+    storage.set_protected_negative(records[1].tile_id, True)
     storage.close()
 
     reopened = AnnotationStorage.open_or_initialize(
         output_root, annotator, tile_records=records
     )
     restored = reopened.get_tile_annotation(first.tile_id)
+    if reopened.protected_negatives != {records[1].tile_id}:
+        raise RuntimeError("Protected Negative did not survive storage reload")
     if (
         restored.status != "positive"
         or len(restored.objects) != 1
@@ -158,6 +161,9 @@ def main() -> int:
             raise RuntimeError("Merge did not create master.json")
         if not (master_root / "merge_report.json").is_file():
             raise RuntimeError("Merge did not create merge_report.json")
+        master = json.loads((master_root / "master.json").read_text(encoding="utf-8"))
+        if master["protected_negatives"]["count"] != 2:
+            raise RuntimeError("Merge lost Protected Negative records")
         app.processEvents()
         print(
             json.dumps(

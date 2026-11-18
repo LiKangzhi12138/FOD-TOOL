@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -53,6 +54,9 @@ class MergeDialog(QDialog):
         self.package_list = QListWidget()
         self.package_list.setMinimumHeight(180)
         layout.addWidget(self.package_list)
+        self.first_wins_checkbox = QCheckBox("重复 Source 自动保留第一份（按照添加顺序）")
+        self.first_wins_checkbox.setChecked(True)
+        layout.addWidget(self.first_wins_checkbox)
 
         output_label = QLabel("Master Dataset 输出目录：")
         layout.addWidget(output_label)
@@ -127,6 +131,7 @@ class MergeDialog(QDialog):
             self.output_edit,
             self.package_list,
             self.merge_button,
+            self.first_wins_checkbox,
         ):
             widget.setEnabled(not processing)
 
@@ -170,6 +175,7 @@ class MergeDialog(QDialog):
                 package_roots,
                 output_text,
                 progress_callback=self._update_progress,
+                first_wins=self.first_wins_checkbox.isChecked(),
             )
         except MergeValidationError as exc:
             self.progress_bar.setRange(0, 1)

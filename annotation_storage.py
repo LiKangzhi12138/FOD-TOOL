@@ -32,6 +32,11 @@ from tile_manager import (
 )
 
 
+from protected_negatives import (
+    MANIFEST_PATH, load_protected_negatives,
+    write_protected_negatives,
+)
+
 ANNOTATION_SCHEMA_VERSION = "1.0"
 TOP_LEVEL_FIELDS = (
     "schema_version",
@@ -238,6 +243,8 @@ class AnnotationStorage:
         self._documents: dict[str, SourceAnnotationDocument] = {}
         self.annotations: dict[str, TileAnnotation] = {}
         self.dirty_sources: set[str] = set()
+        self.protected_negatives: set[str] = set()
+        self._protected_dirty = False
         self._pending_change: dict[str, tuple[str, str, str]] = {}
         self._logger: logging.Logger | None = None
         self._log_handler: logging.FileHandler | None = None
@@ -293,6 +300,9 @@ class AnnotationStorage:
             else:
                 storage._load_all()
                 storage._log(logging.INFO, "加载已有 Annotation 成功")
+            storage.protected_negatives = load_protected_negatives(
+                root, records, storage.annotations
+            )
             return storage
         except Exception as exc:
             try:
@@ -348,6 +358,9 @@ class AnnotationStorage:
                     "缺少 annotations.json：" + ", ".join(missing)
                 )
             storage._load_all()
+            storage.protected_negatives = load_protected_negatives(
+                root, records, storage.annotations
+            )
             return storage
         except Exception as exc:
             storage.close()
@@ -359,7 +372,32 @@ class AnnotationStorage:
 
     @property
     def has_dirty_data(self) -> bool:
-        return bool(self.dirty_sources)
+        return bool(self.dirty_sources) or self._protected_dirty
+
+    def set_protected_negative(self, tile_id: str, enabled: bool) -> None:
+        """复用 dirty/flush 错误保护，标记本身仅存在独立清单中。"""
+        annotation = self.get_tile_annotation(tile_id)
+        if type(enabled) is not bool or (enabled and annotation.status != "negative"):
+            raise AnnotationStorageError(f"TileID={tile_id}：仅 Negative 允许重点负样本标记")
+        self.flush_all()
+        if enabled:
+            self.protected_negatives.add(tile_id)
+        else:
+            self.protected_negatives.discard(tile_id)
+        self._protected_dirty = True
+        self._save_protected_negatives()
+
+    def _save_protected_negatives(self) -> None:
+        if not self._protected_dirty:
+            return
+        try:
+            write_protected_negatives(
+                self.output_root / MANIFEST_PATH, self.tile_records,
+                self.protected_negatives,
+            )
+        except (OSError, ValueError) as exc:
+            raise AnnotationStorageError(f"重点负样本清单保存失败：{exc}") from exc
+        self._protected_dirty = False
 
     def annotation_path(self, source_id: str) -> Path:
         return self.output_root / "sources" / source_id / "annotations.json"
@@ -408,6 +446,9 @@ class AnnotationStorage:
         stored_tile.updated_at = timestamp
         document.updated_at = timestamp
         self.annotations[tile_id] = candidate
+        if candidate.status != "negative" and tile_id in self.protected_negatives:
+            self.protected_negatives.remove(tile_id)
+            self._protected_dirty = True
         self.dirty_sources.add(source_id)
         self._pending_change[source_id] = (tile_id, change_type, timestamp)
         return True
@@ -438,6 +479,8 @@ class AnnotationStorage:
                 self._tiles_by_source[source_id],
                 path,
             )
+            # 先清除已失效的保护记录，再提交状态，防止磁盘出现 Positive+重点负样本。
+            self._save_protected_negatives()
             atomic_write_annotation_json(path, data)
             tile_id, change_type, timestamp = self._pending_change[source_id]
             self._log(
@@ -475,6 +518,7 @@ class AnnotationStorage:
         """Retry every dirty Source, preserving dirty markers on any failure."""
         for source_id in list(self.dirty_sources):
             self.save_source(source_id)
+        self._save_protected_negatives()
 
     def close(self) -> None:
         if getattr(self, "_log_handler", None) is not None:

@@ -553,7 +553,9 @@ def _validate_csv_consistency(
         )
 
 
-def validate_stage3_sources(output_root: str | Path) -> list[SourceMetadata]:
+def validate_stage3_sources(
+    output_root: str | Path, *, require_uniform_tiling: bool = True
+) -> list[SourceMetadata]:
     """Load and cross-check Stage 3's manifest and every source.json."""
     root = Path(output_root).resolve()
     manifest_path = root / "manifests" / "sources.csv"
@@ -629,7 +631,7 @@ def validate_stage3_sources(output_root: str | Path) -> list[SourceMetadata]:
     metadata_records.sort(key=lambda source: source.source_id)
     first = metadata_records[0]
     for metadata in metadata_records[1:]:
-        if (
+        if require_uniform_tiling and (
             metadata.tile_size,
             metadata.overlap,
             metadata.stride,

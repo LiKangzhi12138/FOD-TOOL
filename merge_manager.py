@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import csv
+import hashlib
 import logging
 import os
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -19,15 +21,20 @@ from package_manager import (
     ValidationIssue,
     WorkerPackageSnapshot,
     _source_record,
+    _build_statistics,
     load_finalized_worker_package,
 )
 from source_manager import (
     SourceInitializationError,
     atomic_write_json,
+    calculate_sha256,
     utc_now_iso8601,
     write_sources_manifest,
 )
-from tile_manager import TileInitializationError, TileRecord, write_tiles_manifest
+from tile_manager import TileInitializationError, TileRecord, write_tiles_manifest, load_tile_records, validate_stage3_sources
+from protected_negatives import MANIFEST_PATH, write_protected_negatives, load_protected_negatives
+from annotation_storage import AnnotationStorage
+from PIL import Image
 
 
 MergeProgressCallback = Callable[[int, int, int, int, str, str], None]
@@ -351,6 +358,8 @@ def _build_master(
     snapshots: list[WorkerPackageSnapshot],
     timestamp: str,
     warnings: list[ValidationIssue],
+    resolutions: list[dict] | None = None,
+    input_source_count: int | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     source_pairs = sorted(
         (
@@ -404,6 +413,15 @@ def _build_master(
         "tile_count": len(all_tiles),
         "annotation_statistics": statistics,
     }
+    # 每个 Worker 已逐条验证。原有跨包 Source/Tile 冲突检测先于此处执行。
+    protected = set().union(*(snapshot.protected_negatives for snapshot in snapshots))
+    write_protected_negatives(staging / MANIFEST_PATH, all_tiles, protected)
+    master_data["schema_version"] = "1.1"
+    master_data["protected_negatives"] = {
+        "path": MANIFEST_PATH.as_posix(),
+        "sha256": calculate_sha256(staging / MANIFEST_PATH),
+        "count": len(protected),
+    }
     report_data = {
         "schema_version": PACKAGE_SCHEMA_VERSION,
         "report_type": "worker_package_merge",
@@ -416,6 +434,28 @@ def _build_master(
         "conflicts": [],
         "statistics": statistics,
     }
+    resolutions = resolutions or []
+    summary = {
+        "input_source_record_count": input_source_count if input_source_count is not None else len(source_pairs),
+        "duplicate_source_count": len(resolutions),
+        "unique_source_count": len(source_pairs),
+        "skipped_source_record_count": sum(len(row["skipped_workers"]) for row in resolutions),
+        "annotation_difference_source_count": sum(row["annotation_difference_detected"] for row in resolutions),
+        "protected_negative_merge_count": sum(row["protected_negative_merge_count"] for row in resolutions),
+        "protected_negative_count": len(protected),
+    }
+    report_data["duplicate_resolution"] = summary
+    master_data["duplicate_resolution"] = summary
+    with (staging / "duplicate_resolution_report.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[
+            "source_id", "selected_worker", "skipped_workers", "resolution",
+            "annotation_difference_detected", "protected_negative_merge_count",
+            "original_scenes", "final_scene", "final_group_id",
+        ])
+        writer.writeheader()
+        for row in resolutions:
+            writer.writerow({**row, "skipped_workers": json.dumps(row["skipped_workers"], ensure_ascii=False),
+                "original_scenes": json.dumps(row["original_scenes"], ensure_ascii=False)})
     atomic_write_json(staging / "master.json", master_data)
     atomic_write_json(staging / "merge_report.json", report_data)
     _write_merge_log(
@@ -428,13 +468,184 @@ def _build_master(
             f"merge success | sources={len(source_pairs)} | tiles={len(all_tiles)}",
         ],
     )
+    # 指纹从实际 Master 内容重建，包含图片、annotation、清单及去重报告。
+    master_data["content_fingerprint"] = compute_master_fingerprint(staging)
+    atomic_write_json(staging / "master.json", master_data)
     return master_data, report_data
+
+
+def compute_master_fingerprint(root: str | Path) -> str:
+    """按 POSIX 路径及文件 SHA256 绑定实际数据，排除日志和自引用 master.json。"""
+    root = Path(root)
+    paths = [path for path in root.rglob("*") if path.is_file()
+             and path.relative_to(root).parts[0] != "logs"
+             and path.relative_to(root).as_posix() != "master.json"]
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: item.relative_to(root).as_posix()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
+        digest.update(calculate_sha256(path).encode("ascii") + b"\n")
+    return digest.hexdigest()
+
+
+def validate_master_dataset(root: str | Path) -> dict:
+    """独立重读实际 Master 的格式、统计、保护清单和全文件内容指纹。"""
+    root = Path(root)
+    data = json.loads((root / "master.json").read_text(encoding="utf-8"))
+    if data["content_fingerprint"] != compute_master_fingerprint(root):
+        raise ValueError("Master content_fingerprint 不一致")
+    # Master 保留各独立 Source 的真实切片参数，Worker/切片入口仍要求统一参数。
+    sources = validate_stage3_sources(root, require_uniform_tiling=False)
+    tiles = load_tile_records(root)
+    annotations = {}
+    for source in sources:
+        # Master 可包含不同 annotator；按 Source 校验 JSON，最后统一校验整份保护清单。
+        storage = AnnotationStorage(root, source.annotator_id,
+            [source], [tile for tile in tiles if tile.source_id == source.source_id],
+            enable_logging=False)
+        storage._validate_project_metadata()
+        storage._load_all()
+        annotations.update(storage.annotations)
+        storage.close()
+    protected = load_protected_negatives(root, tiles, annotations, require_completed=True)
+    if any(not annotation.completed for annotation in annotations.values()):
+        raise ValueError("Master 包含尚未完成的 Tile")
+    for tile in tiles:
+        with Image.open(root / tile.tile_relative_path) as image:
+            if image.size != (tile.width, tile.height):
+                raise ValueError(f"Master Tile 尺寸不符：{tile.tile_id}")
+            image.verify()
+    if (len(sources) != data["source_count"] or len(tiles) != data["tile_count"]
+            or _build_statistics(annotations) != data["annotation_statistics"]
+            or len(protected) != data["protected_negatives"]["count"]
+            or calculate_sha256(root / MANIFEST_PATH) != data["protected_negatives"]["sha256"]):
+        raise ValueError("Master 实际内容与统计或重点负样本摘要不一致")
+    return data
+
+
+def _first_wins(snapshots, resolve_source_variants=False):
+    """先验证几何与原图身份，再按传入顺序保留整份 Source。"""
+    owners = {}
+    hashes = {}
+    source_ids = {}
+    annotations = {}
+    for snapshot in snapshots:
+        storage = AnnotationStorage.load_existing_read_only(
+            snapshot.root, snapshot.annotator_id, snapshot.sources, snapshot.tiles
+        )
+        annotations[snapshot.root] = storage.annotations
+        storage.close()
+        for source in snapshot.sources:
+            previous_sha = source_ids.setdefault(source.source_id, source.original_sha256)
+            if previous_sha != source.original_sha256:
+                raise MergeValidationError("同 SourceID 的完整 SHA256 不同", [
+                    _issue("SOURCE_ID_COLLISION", source.source_id, source_id=source.source_id)
+                ])
+            key = hashes.setdefault(source.original_sha256, source.source_id)
+            owners.setdefault(key, []).append((snapshot, source))
+    selected = {snapshot.root: [] for snapshot in snapshots}
+    protected = {snapshot.root: set() for snapshot in snapshots}
+    resolutions = []
+    compatibility_issues = []
+    for matches in owners.values():
+        original_matches = list(matches)
+        if resolve_source_variants and len(matches) > 1:
+            # 同原图存在不同几何时，必须找到完整标准版本，保持整份 Source 不变。
+            geometries = {(s.tile_size, s.overlap, s.stride) for _, s in matches}
+            if len(geometries) > 1:
+                standard = [(owner, s) for owner, s in matches
+                            if (s.tile_size, s.overlap, s.stride) == (1024, 256, 768)
+                            and len([t for t in owner.tiles if t.source_id == s.source_id]) == 77]
+                if not standard:
+                    raise MergeValidationError("切片冲突缺少完整标准77 Tile版本", [
+                        _issue("SOURCE_METADATA_CONFLICT", matches[0][1].source_id)
+                    ])
+                chosen_match = standard[0]
+                matches = [chosen_match] + [m for m in matches if m != chosen_match]
+        winner, source = matches[0]
+        selected[winner.root].append(source)
+        tiles = [tile for tile in winner.tiles if tile.source_id == source.source_id]
+        geometry = [(tile.x, tile.y, tile.width, tile.height) for tile in tiles]
+        chosen = {tile.tile_id for tile in tiles} & winner.protected_negatives
+        different = False
+        extra = set()
+        for other, candidate in matches[1:]:
+            fields = ("scene", "group_id", "original_width", "original_height", "tile_size", "overlap", "stride")
+            other_tiles = [tile for tile in other.tiles if tile.source_id == candidate.source_id]
+            required_fields = ("original_width", "original_height") if resolve_source_variants else fields
+            if any(getattr(source, field) != getattr(candidate, field) for field in required_fields) or (not resolve_source_variants and geometry != [
+                (tile.x, tile.y, tile.width, tile.height) for tile in other_tiles
+            ]):
+                differences = {field: [getattr(source, field), getattr(candidate, field)]
+                               for field in fields if getattr(source, field) != getattr(candidate, field)}
+                compatibility_issues.append(_issue("SOURCE_METADATA_CONFLICT",
+                    f"{source.source_id}：{winner.root} vs {other.root}；"
+                    f"metadata差异={differences}；Tile数量={len(tiles)} vs {len(other_tiles)}",
+                    source_id=source.source_id, package=other.root))
+                continue
+            # 忽略标注人员和时间。备注也参与比较，存在任何内容分歧时整份使用第一份。
+            same = geometry == [(t.x, t.y, t.width, t.height) for t in other_tiles] and all(
+                (annotations[winner.root][a.tile_id].status,
+                 annotations[winner.root][a.tile_id].objects,
+                 annotations[winner.root][a.tile_id].notes) ==
+                (annotations[other.root][b.tile_id].status,
+                 annotations[other.root][b.tile_id].objects,
+                 annotations[other.root][b.tile_id].notes)
+                for a, b in zip(tiles, other_tiles)
+            )
+            different |= not same
+            if same:
+                extra.update(a.tile_id for a, b in zip(tiles, other_tiles)
+                             if b.tile_id in other.protected_negatives)
+            if resolve_source_variants:
+                # 逐 Tile 只转移合法 Negative 的保护标记，坐标/宽高必须完全一致。
+                by_geometry = {(t.x, t.y, t.width, t.height): t for t in other_tiles}
+                for tile in tiles:
+                    other_tile = by_geometry.get((tile.x, tile.y, tile.width, tile.height))
+                    if other_tile is None:
+                        continue
+                    a = annotations[winner.root][tile.tile_id]
+                    b = annotations[other.root][other_tile.tile_id]
+                    if (a.status == b.status == "negative" and not a.objects and not b.objects
+                            and other_tile.tile_id in other.protected_negatives):
+                        extra.add(tile.tile_id)
+        # 只有整份 Source 标注一致才允许取保护标记并集。
+        added = extra - chosen if resolve_source_variants or not different else set()
+        protected[winner.root].update(chosen | added)
+        if len(matches) > 1:
+            row = {
+                "source_id": source.source_id, "selected_worker": str(winner.root),
+                "skipped_workers": [str(other.root) for other, _ in matches[1:]],
+                "resolution": "standard_geometry_then_first_wins" if matches != original_matches else "first_wins", "annotation_difference_detected": different,
+                "protected_negative_merge_count": len(added),
+            }
+            row["original_scenes"] = [{"worker": str(owner.root), "source_id": s.source_id,
+                "scene": s.scene, "group_id": s.group_id,
+                "tile_size": s.tile_size, "overlap": s.overlap, "stride": s.stride,
+                "tile_count": sum(t.source_id == s.source_id for t in owner.tiles)}
+                for owner, s in original_matches]
+            row["final_scene"] = source.scene
+            row["final_group_id"] = source.group_id
+            resolutions.append(row)
+    if compatibility_issues:
+        raise MergeValidationError("重复 Source metadata 或 Tile 几何不兼容", compatibility_issues)
+    filtered = []
+    for snapshot in snapshots:
+        ids = {source.source_id for source in selected[snapshot.root]}
+        tiles = [tile for tile in snapshot.tiles if tile.source_id in ids]
+        filtered.append(replace(snapshot, sources=selected[snapshot.root], tiles=tiles,
+            scenes=sorted({source.scene for source in selected[snapshot.root]}),
+            protected_negatives=protected[snapshot.root],
+            statistics=_build_statistics({tile.tile_id: annotations[snapshot.root][tile.tile_id] for tile in tiles})))
+    return filtered, resolutions
 
 
 def merge_worker_packages(
     package_roots: Iterable[str | Path],
     master_output_root: str | Path,
     progress_callback: MergeProgressCallback | None = None,
+    *,
+    first_wins: bool = False,
+    resolve_source_variants: bool = False,
 ) -> MergeResult:
     """Preflight every package and conflict before staging the Master Dataset."""
     roots = [Path(path).resolve() for path in package_roots]
@@ -469,7 +680,14 @@ def merge_worker_packages(
         except PackageValidationError as exc:
             validation_issues.extend(exc.issues)
 
+    resolutions = []
+    input_source_count = sum(len(snapshot.sources) for snapshot in snapshots)
     if len(snapshots) == len(roots):
+        if first_wins:
+            try:
+                snapshots, resolutions = _first_wins(snapshots, resolve_source_variants)
+            except MergeValidationError as exc:
+                validation_issues.extend(exc.issues)
         validation_issues.extend(_cross_package_issues(snapshots))
     errors = [item for item in validation_issues if item.severity == "error"]
     warnings = [item for item in validation_issues if item.severity == "warning"]
@@ -488,8 +706,9 @@ def merge_worker_packages(
     target_was_empty = target.is_dir()
     try:
         master_data, _report_data = _build_master(
-            staging, snapshots, timestamp, warnings
+            staging, snapshots, timestamp, warnings, resolutions, input_source_count
         )
+        validate_master_dataset(staging)
         if target_was_empty:
             target.rmdir()
         os.replace(staging, target)

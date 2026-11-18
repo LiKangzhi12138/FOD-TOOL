@@ -34,7 +34,7 @@ def test_finalize_valid_worker_builds_package_statistics_and_canonical_manifest(
     package = read_json(result.package_path)
     assert package["schema_version"] == "1.0"
     assert package["package_type"] == "worker"
-    assert package["tool_version"] == "0.1.0"
+    assert package["tool_version"] == "0.2.0"
     assert package["source_count"] == 1
     assert package["tile_count"] == 1
     assert package["annotation_statistics"] == {

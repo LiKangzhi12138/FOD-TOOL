@@ -2,7 +2,7 @@
 
 机场跑道 FOD（Foreign Object Debris，外来物）数据初始化、固定尺寸切片、人工标注、Worker 成果封装以及多 Worker 严格合并桌面工具。
 
-项目面向 Windows 10 / Windows 11，支持多名标注人员分别 clone 或使用 Windows 发行版离线工作。当前工具版本为 `0.1.0`，Source、Annotation 和 Worker Package schema 版本均为 `1.0`。
+项目面向 Windows 10 / Windows 11，支持多名标注人员分别 clone 或使用 Windows 发行版离线工作。当前工具版本为 `0.2.0`。Source 和 Annotation schema 为 `1.0`，Worker Package 支持 `1.0` 和 `1.1`，新 Master 使用 `1.1`。
 
 ## 当前能力
 
@@ -234,6 +234,18 @@ Notes 使用约 400 ms debounce；导航、返回设置和关闭程序前会强�
 
 ## 管理员 Merge 流程
 
+Merge 界面默认勾选“重复 Source 自动保留第一份（按照添加顺序）”。按列表添加顺序决定优先级，SourceID 与完整原图 SHA256、scene/group 和 Tile 几何必须一致。所有输入包先通过完整性校验，再保留第一份完整 Source 的 metadata、图片及 annotation。存在 annotation 分歧时保留第一份的重点负样本结果。整份 Source 的状态、bbox 和备注均一致时，重点负样本取安全并集。
+
+取消勾选可使用原有严格冲突模式。Python 接口 `merge_worker_packages(..., first_wins=True)` 显式启用 first-wins，默认值 `False` 保留严格模式。
+
+对已授权的 V3 场景/切片冲突，可显式传入 `first_wins=True, resolve_source_variants=True`。该模式按完整原图 SHA256 分组，scene/group 差异采用首份完整 Source。几何冲突优先选择 `1024/256/768` 且包含完整 77 Tile 的版本，多个标准版本按输入顺序选择。仅在同坐标、同宽高且双方均为合法 Negative、空 bbox 时逐 Tile 合并重点负样本。被选中的 SourceID、metadata、图片和 annotation 直接保留原始版本。报告新增 `original_scenes`、`final_scene`、`final_group_id`。
+
+Master 可保留不同独立 Source 的真实切片参数，`validate_master_dataset` 对其逐 Source 校验。Worker 和切片初始化入口仍要求包内统一参数。
+
+成功输出额外包含 `duplicate_resolution_report.csv`（UTF-8 BOM），记录被选择及跳过的 Worker、annotation 分歧和新增重点负样本数。`merge_report.json` 与 `master.json` 的 `duplicate_resolution` 提供输入/最终 Source 数量和去重统计。统计由实际选中的 Tile 重新计算。
+
+`master.json.content_fingerprint` 使用按 POSIX 相对路径排序的文件内容摘要重建。每个文件依次加入 `UTF-8路径 + NUL + 小写SHA256 + LF`，最终计算 SHA256。覆盖图片、Source/Annotation JSON、manifests 和去重报告，排除 `logs/` 与根目录 `master.json`。可调用 `merge_manager.validate_master_dataset(path)` 重新校验格式、annotation、统计、重点负样本及内容指纹。原 Worker 的指纹在 Master 中仅作来源追溯。
+
 1. 在主页面点击“Merge Worker Packages”。
 2. 添加一个或多个已经 Finalize 的 Worker Output 根目录。
 3. 选择一个新的空 Master Dataset 输出目录。
@@ -391,7 +403,13 @@ python -m py_compile main.py source_manager.py tile_manager.py image_viewer.py a
 pytest -q
 ```
 
-测试覆盖 Source、Tile 几何、Manifest 加载、Viewer、bbox、Tile 状态、Annotation 持久化、原子写入失败、Finalize、fingerprint、Merge 冲突和 GUI offscreen 构造。当前基线为 `128 passed`。
+测试覆盖 Source、Tile 几何、Manifest 加载、Viewer、bbox、Tile 状态、Annotation 持久化、原子写入失败、Finalize、fingerprint、Merge 冲突和 GUI offscreen 构造。重点负样本升级后基线为 160 项，first-wins Merge 增加 13 项，授权的 Source 版本处理增加 7 项，当前结果为 `180 passed`。
+
+若系统临时目录路径过长，可指定项目内的独立短路径运行验收。
+
+```powershell
+pytest -q --basetemp=.test_tmp_acceptance -p no:cacheprovider
+```
 
 ## 构建 Windows 发行版
 
@@ -400,7 +418,7 @@ PyInstaller 是构建依赖，不写入普通运行依赖：
 ```powershell
 conda activate fod-annotator
 python -m pip install -r requirements-build.txt
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build_windows.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\build_windows.ps1 -ReleaseVersion 0.2.0
 ```
 
 也可以显式指定 Python 3.11：
@@ -410,13 +428,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\build_windows.ps1 `
   -PythonPath D:\path\to\python.exe
 ```
 
-构建脚本只清理项目中的 `build/`、`dist/` 和对应 `release/` 产物，使用 [fod_annotation_tool.spec](fod_annotation_tool.spec) 构建 windowed onedir 发行版，不使用 UPX，也不请求管理员权限。
+构建脚本在 `build/<版本>/`、`dist/<版本>/` 中构建，并将发行包输出到 `release/<版本>/`。已经存在的同版本发行目录或 ZIP 会使构建停止，请为后续发行指定新的版本。构建使用 [fod_annotation_tool.spec](fod_annotation_tool.spec) 定义的 windowed onedir 模式。
 
 输出：
 
 ```text
-release/FOD标注工具/
-release/FOD标注工具_Windows.zip
+release/0.2.0/FOD标注工具/
+release/0.2.0/FOD标注工具_Windows.zip
 ```
 
 ## 项目结构
@@ -449,6 +467,60 @@ fod-annotation-tool/
 - Worker 应在全部 Tile 完成后 Finalize，并将整个 Worker Output 文件夹交给管理员。
 - 管理员必须使用内置 Merge 功能生成 Master Dataset。
 - 真实机场图片、Worker Output、Master Dataset、日志和构建产物不应提交到 Git。
+
+## 重点负样本接口（0.2.0）
+
+在右侧 Tile 状态分组中，Negative Tile 可勾选“重点负样本（训练时必须保留）”。标记立即原子保存，切换 Tile 和重启后恢复。清除状态或改为其他状态会自动清除标记。该标记独立于四种检测类别和四种 Tile 状态。
+
+唯一持久化来源为 Worker 或 Master 根目录下的 `manifests/protected_negatives.csv`。Annotation JSON schema 保持 `1.0`。
+
+```csv
+scene,source_id,tile_id
+S01,S01_A84F39BC21D7F238,S01_A84F39BC21D7F238_X000768_Y001536
+```
+
+文件使用 UTF-8 BOM（Python `utf-8-sig`）与 CRLF 换行，列顺序固定为 `scene,source_id,tile_id`。每条记录对应一张 Tile。顺序遵循 Tile manifest，重复记录直接报错。取消全部勾选后，文件保留表头且没有数据行。
+
+### 草稿与正式交付校验
+
+工作区允许对尚未完成的 Negative 先勾选。草稿记录必须匹配已存在 Tile 的 scene 和 SourceID，并满足 `negative`、`trainable=true`、`objects=[]`。Finalize 和 Merge 进一步要求 `completed=true`。非法记录会报告 SourceID 和 TileID，用户需要修正实际数据后重试。
+
+重点负样本保存失败时，dirty 标记会保留。现有导航、返回和关闭前的 flush 会重试保存，持续失败会阻止离开工作区。状态变化时先写入清除后的清单，再提交 annotation。若后一步写入失败，磁盘可能暂时保留原 Negative annotation 和已清除的标记，内存中的状态变更仍为 dirty，重试后完成提交。突然断电后的跨文件恢复遵循这两个独立原子文件的实际内容。
+
+### Worker 格式兼容与完整性
+
+- 历史 `1.0` Worker 缺少清单时按空集读取，继续使用原来的内容指纹算法。
+- 含清单的 Worker（包括只有表头的空清单）在 Finalize 时声明 schema `1.1`。清单完整字节的 SHA256 被加入 `content_fingerprint`，标签为 `manifests/protected_negatives.csv`。
+- `1.1` 包缺少清单、清单被修改、存在无效记录或与 annotation 冲突时，校验失败。重新 Finalize 也会拒绝将缺失清单的 `1.1` 包降级。
+- `1.0` 包出现未声明的清单时，必须使用新版工具重新 Finalize。
+- 旧版工具会拒绝 `1.1` Worker。含重点负样本的数据应通过新版 Finalize 和 Merge 处理，以保留标记。
+
+### Master 与后续数据划分工具
+
+新版 Merge 对每个 Worker 逐条验证，并沿用原有跨包 SourceID、原图 SHA256、TileID 冲突检测。成功后在 Master 输出完整清单，同时在 `master.json` 写入以下描述。
+
+```json
+{
+  "schema_version": "1.1",
+  "protected_negatives": {
+    "path": "manifests/protected_negatives.csv",
+    "sha256": "完整64位小写SHA256",
+    "count": 20
+  }
+}
+```
+
+后续划分工具应执行以下步骤。
+
+1. 读取 `master.json`，对声明的 CSV 完整字节重新计算 SHA256，与 `protected_negatives.sha256` 比较，并验证 count。
+2. 用 `utf-8-sig`、`newline=""` 和 `csv.DictReader` 读取固定三列。
+3. 通过 `source_id + tile_id` 关联 `sources/<SourceID>/annotations.json` 与 `manifests/tiles.csv`，逐条检查 scene、归属、Negative、completed、trainable 和空 objects。
+4. 保留所有 Positive 与重点 Negative，对普通 Negative 执行抽样。
+5. 将清单 SHA256 和 Master 标识写入划分或导出报告，绑定实际使用的输入。
+
+历史 `1.0` Master 没有该文件和描述时按无重点负样本处理。新版 `1.1` Master 必须同时具备清单与描述，包括空清单。`1.0` Master 如果单独出现清单，应先确认其来源并重新通过新版 Merge 生成有完整性声明的 Master。
+
+Master 的新增 SHA256 描述绑定清单内容。旧版 Master 没有覆盖此文件的整体 fingerprint，因此后续工具必须显式验证该描述。该校验属于数据完整性检查，发行来源的可信性仍由交付流程保证。
 
 ## 许可证
 

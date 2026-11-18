@@ -7,6 +7,7 @@ from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -489,6 +490,9 @@ class MainWindow(QMainWindow):
         self.clear_status_button.clicked.connect(self.clear_current_tile_status)
         status_layout.addWidget(self.clear_status_button, 2, 0, 1, 2)
         status_group_layout.addLayout(status_layout)
+        self.protected_negative_checkbox = QCheckBox("重点负样本（训练时必须保留）")
+        self.protected_negative_checkbox.toggled.connect(self._set_protected_negative)
+        status_group_layout.addWidget(self.protected_negative_checkbox)
 
         self.current_status_label = QLabel("当前 Tile 状态：未标注")
         self.trainable_label = QLabel("Trainable：否")
@@ -1228,6 +1232,13 @@ class MainWindow(QMainWindow):
         annotation = self._current_tile_annotation()
         has_tile = tile_id is not None and annotation is not None
         status = annotation.status if annotation is not None else None
+        blocker = QSignalBlocker(self.protected_negative_checkbox)
+        self.protected_negative_checkbox.setEnabled(has_tile and status == "negative")
+        self.protected_negative_checkbox.setChecked(
+            self._annotation_storage is not None
+            and tile_id in self._annotation_storage.protected_negatives
+        )
+        del blocker
 
         self.status_button_group.setExclusive(False)
         for value, button in self.status_buttons.items():
@@ -1258,6 +1269,19 @@ class MainWindow(QMainWindow):
         self.image_viewer.set_drawing_enabled(
             has_tile and drawing_enabled_for_status(status)
         )
+
+    def _set_protected_negative(self, enabled: bool) -> None:
+        tile_id = self._current_tile_id()
+        if tile_id is None or self._annotation_storage is None:
+            return
+        self._set_autosave_state("pending")
+        try:
+            self._annotation_storage.set_protected_negative(tile_id, enabled)
+        except AnnotationStorageError as exc:
+            self._show_save_failure(exc)
+        else:
+            self._set_autosave_state("saved")
+        self._refresh_status_panel()
 
     def set_current_tile_status(self, status: str | None) -> bool:
         tile_id = self._current_tile_id()
